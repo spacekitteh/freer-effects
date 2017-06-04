@@ -66,7 +66,7 @@ append = (><)
 
 -- | Left view deconstruction data structure.
 data ViewL arr a b where
-    TOne  :: Arrow arr => arr a b -> ViewL m a b
+    TOne  :: Arrow arr => arr a b -> ViewL arr a b
     (:|)  :: Arrow arr => arr a x -> FTCQueue arr x b -> ViewL arr a b
 
 -- | Left view deconstruction. [average O(1)]
