@@ -53,9 +53,6 @@ module Control.Monad.Freer.Internal
     -- ** Sending Arbitrary Effect
     , send
 
-    -- ** Lifting Effect Stacks
-    , raise
-
     -- * Handling Effects
     , run
     , runM
@@ -64,8 +61,6 @@ module Control.Monad.Freer.Internal
     , handleRelay
     , handleRelayS
     , interpose
-    , replaceRelay
-    , replaceRelayS
 
     -- *** Low-level Functions for Building Effect Handlers
     , qApp
@@ -94,68 +89,70 @@ import Data.Maybe (Maybe(Just))
 
 import Data.FTCQueue
 import Data.OpenUnion
+import Control.Arrow ( Kleisli(..), (<<^))
 
 
 -- | Effectful arrow type: a function from @a :: *@ to @b :: *@ that also does
 -- effects denoted by @effs :: [* -> *]@.
-type Arr effs a b = a -> Eff effs b
+type Arr effs arr a b = Kleisli (Eff effs arr) a b --a -> Eff effs b
 
 -- | An effectful function from @a :: *@ to @b :: *@ that is a composition of
 -- several effectful functions. The paremeter @eff :: [* -> *]@ describes the
 -- overall effect. The composition members are accumulated in a type-aligned
 -- queue.
-type Arrs effs a b = FTCQueue (Eff effs) a b
+type Arrs effs arr a b = FTCQueue (Kleisli (Eff effs arr)) a b
 
 -- | The Eff monad provides a way to use effects in Haskell, in such a way that
 -- different types of effects can be interleaved, and so that the produced code
 -- is efficient.
-data Eff effs a
+data Eff effs arr  a
     = Val a
     -- ^ Pure value (@'return' = 'pure' = 'Val'@).
-    | forall b. E (Union effs b) (Arrs effs b a)
+    | forall b. E (Union effs b) (Arrs effs arr b a)
     -- ^ Sending a request of type @Union effs@ with the continuation
     -- @'Arrs' r b a@.
 
 -- | Function application in the context of an array of effects,
 -- @'Arrs' effs b w@.
-qApp :: Arrs effs b w -> b -> Eff effs w
+qApp :: Arrs effs arr b w -> b -> Eff effs arr w
 qApp q' x = case tviewl q' of
-    TOne k  -> k x
-    k :| t -> case k x of
+    TOne k  -> (runKleisli k) x
+    k :| t -> case (runKleisli k) x of
         Val y -> qApp t y
         E u q -> E u (q >< t)
 
 -- | Composition of effectful arrows ('Arrs'). Allows for the caller to change
 -- the effect environment, as well.
-qComp :: Arrs effs a b -> (Eff effs b -> Eff effs' c) -> Arr effs' a c
-qComp g h a = h $ qApp g a
+qComp :: Arrs effs arr a b -> (Eff effs arr b -> Eff effs' arr c) -> Arr effs' arr a c
+qComp g h = Kleisli (\a -> h $ qApp g a)
 
-instance Functor (Eff effs) where
-    fmap f (Val x) = Val (f x)
-    fmap f (E u q) = E u (q |> (Val . f))
-    {-# INLINE fmap #-}
+instance Functor (Eff effs arr) where 
+   fmap f (Val x) = Val (f x)
+   fmap f (E u q) = E u (q |> ((Kleisli Val) <<^ f))
+   {-# INLINE fmap #-}
 
-instance Applicative (Eff effs) where
+instance Applicative (Eff effs arr) where
     pure = Val
     {-# INLINE pure #-}
 
     Val f <*> Val x = Val $ f x
-    Val f <*> E u q = E u (q |> (Val . f))
-    E u q <*> m     = E u (q |> (`fmap` m))
+    Val f <*> E u q = E u (q |> ((Kleisli Val) <<^ f))
+    E u q <*> Val x = E u (q |> ((Kleisli Val) <<^ ($ x)))
+    E u q <*> m     = E u (q |> (Kleisli (`fmap` m)))
     {-# INLINE (<*>) #-}
 
-instance Monad (Eff effs) where
+instance Monad (Eff effs arr) where
     -- Future versions of GHC will consider any other definition as error.
     return = pure
     {-# INLINE return #-}
 
     Val x >>= k = k x
-    E u q >>= k = E u (q |> k)
+    E u q >>= k = E u (q |> (Kleisli k))
     {-# INLINE (>>=) #-}
 
 -- | Send a request and wait for a reply.
-send :: Member eff effs => eff a -> Eff effs a
-send t = E (inj t) (tsingleton Val)
+send :: Member eff effs => eff a -> Eff effs arr a
+send t = E (inj t) (tsingleton (Kleisli Val))
 
 --------------------------------------------------------------------------------
                        -- Base Effect Runner --
@@ -167,63 +164,28 @@ send t = E (inj t) (tsingleton Val)
 -- @
 -- 'run' . runEff1 eff1Arg . runEff2 eff2Arg1 eff2Arg2 $ someProgram
 -- @
-run :: Eff '[] a -> a
+run :: Eff '[] arr a -> a
 run (Val x) = x
 run _       = error "Internal:run - This (E) should never happen"
 
 -- | Runs a set of Effects. Requires that all effects are consumed, except for
 -- a single effect known to be a monad. The value returned is a computation in
 -- that monad. This is useful for plugging in traditional transformer stacks.
-runM :: Monad m => Eff '[m] a -> m a
+runM :: Monad m => Eff '[m] arr a -> m a
 runM (Val x) = return x
 runM (E u q) = case extract u of
     mb -> mb >>= runM . qApp q
     -- The other case is unreachable since Union [] a cannot be constructed.
     -- Therefore, run is a total function if its argument terminates.
 
--- | Like 'replaceRelay', but with support for an explicit state to help
--- implement the interpreter.
-replaceRelayS
-    :: s
-    -> (s -> a -> Eff (v ': effs) w)
-    -> (forall x. s -> t x -> (s -> Arr (v ': effs) x w) -> Eff (v ': effs) w)
-    -> Eff (t ': effs) a
-    -> Eff (v ': effs) w
-replaceRelayS s' pure' bind = loop s'
-  where
-    loop s (Val x)  = pure' s x
-    loop s (E u' q) = case decomp u' of
-        Right x -> bind s x k
-        Left  u -> E (weaken u) (tsingleton (k s))
-      where
-        k s'' x = loop s'' $ qApp q x
-
--- | Interpret an effect by transforming it into another effect on top of the
--- stack. The primary use case of this function is allow interpreters to be
--- defined in terms of other ones without leaking intermediary implementation
--- details through the type signature.
-replaceRelay
-    :: (a -> Eff (v ': effs) w)
-    -> (forall x. t x -> Arr (v ': effs) x w -> Eff (v ': effs) w)
-    -> Eff (t ': effs) a
-    -> Eff (v ': effs) w
-replaceRelay pure' bind = loop
-  where
-    loop (Val x)  = pure' x
-    loop (E u' q) = case decomp u' of
-        Right x -> bind x k
-        Left  u -> E (weaken u) (tsingleton k)
-      where
-        k = qComp q loop
-
 -- | Given a request, either handle it or relay it.
 handleRelay
-    :: (a -> Eff effs b)
+    :: (a -> Eff effs arr b)
     -- ^ Handle a pure value.
-    -> (forall v. eff v -> Arr effs v b -> Eff effs b)
+    -> (forall v. eff v -> Arr effs arr v b -> Eff effs arr b)
     -- ^ Handle a request for effect of type @eff :: * -> *@.
-    -> Eff (eff ': effs) a
-    -> Eff effs b
+    -> Eff (eff ': effs) arr a
+    -> Eff effs arr b
     -- ^ Result with effects of type @eff :: * -> *@ handled.
 handleRelay ret h = loop
   where
@@ -239,29 +201,29 @@ handleRelay ret h = loop
 -- can- handle the target effect.
 handleRelayS
     :: s
-    -> (s -> a -> Eff effs b)
+    -> (s -> a -> Eff effs arr b)
     -- ^ Handle a pure value.
-    -> (forall v. s -> eff v -> (s -> Arr effs v b) -> Eff effs b)
+    -> (forall v. s -> eff v -> (s -> Arr effs arr v b) -> Eff effs arr b)
     -- ^ Handle a request for effect of type @eff :: * -> *@.
-    -> Eff (eff ': effs) a
-    -> Eff effs b
+    -> Eff (eff ': effs) arr a
+    -> Eff effs arr b
     -- ^ Result with effects of type @eff :: * -> *@ handled.
 handleRelayS s' ret h = loop s'
   where
     loop s (Val x)  = ret s x
     loop s (E u' q) = case decomp u' of
-        Right x -> h s x k
-        Left  u -> E u (tsingleton (k s))
+        Right x -> h s x ((\a -> Kleisli (k a)))
+        Left  u -> E u (tsingleton (Kleisli (k s)))
       where
         k s'' x = loop s'' $ qApp q x
 
 -- | Intercept the request and possibly reply to it, but leave it unhandled.
 interpose
     :: Member eff effs
-    => (a -> Eff effs b)
-    -> (forall v. eff v -> Arr effs v b -> Eff effs b)
-    -> Eff effs a
-    -> Eff effs b
+    => (a -> Eff effs arr b)
+    -> (forall v. eff v -> Arr effs arr v b -> Eff effs arr b)
+    -> Eff effs arr a
+    -> Eff effs arr b
 interpose ret h = loop
   where
     loop (Val x) = ret x
@@ -270,14 +232,6 @@ interpose ret h = loop
         _      -> E u (tsingleton k)
       where
         k = qComp q loop
-
--- | Embeds a less-constrained 'Eff' into a more-constrained one. Analogous to
--- MTL's 'lift'.
-raise :: Eff effs a -> Eff (e ': effs) a
-raise = loop
-  where
-    loop (Val x) = pure x
-    loop (E u q) = E (weaken u) . tsingleton $ qComp q loop
 
 --------------------------------------------------------------------------------
                     -- Nondeterministic Choice --
@@ -288,10 +242,10 @@ data NonDet a where
     MZero :: NonDet a
     MPlus :: NonDet Bool
 
-instance Member NonDet effs => Alternative (Eff effs) where
+instance Member NonDet effs => Alternative (Eff effs arr) where
     empty = mzero
     (<|>) = mplus
 
-instance Member NonDet effs => MonadPlus (Eff effs) where
+instance Member NonDet effs => MonadPlus (Eff effs arr) where
     mzero       = send MZero
     mplus m1 m2 = send MPlus >>= \x -> if x then m1 else m2
