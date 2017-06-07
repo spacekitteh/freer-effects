@@ -105,7 +105,7 @@ type Arrs effs arr a b = FTCQueue (Kleisli (Eff effs arr)) a b
 -- | The Eff monad provides a way to use effects in Haskell, in such a way that
 -- different types of effects can be interleaved, and so that the produced code
 -- is efficient.
-data Eff effs arr  a
+data Eff effs (arr :: * -> * -> *)  a
     = Val a
     -- ^ Pure value (@'return' = 'pure' = 'Val'@).
     | forall b. E (Union effs b) (Arrs effs arr b a)
@@ -180,7 +180,7 @@ runM (E u q) = case extract u of
 
 -- | Given a request, either handle it or relay it.
 handleRelay
-    :: (a -> Eff effs arr b)
+    :: (a -> Eff effs arr b) -- Should be an arrow
     -- ^ Handle a pure value.
     -> (forall v. eff v -> Arr effs arr v b -> Eff effs arr b)
     -- ^ Handle a request for effect of type @eff :: * -> *@.
