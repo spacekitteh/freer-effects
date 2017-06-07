@@ -180,7 +180,7 @@ runM (E u q) = case extract u of
 
 -- | Given a request, either handle it or relay it.
 handleRelay
-    :: (a -> Eff effs arr b) -- Should be an arrow
+    :: arr a (Eff effs arr b) -- Should be an arrow
     -- ^ Handle a pure value.
     -> (forall v. eff v -> Arr effs arr v b -> Eff effs arr b)
     -- ^ Handle a request for effect of type @eff :: * -> *@.
@@ -189,7 +189,7 @@ handleRelay
     -- ^ Result with effects of type @eff :: * -> *@ handled.
 handleRelay ret h = loop
   where
-    loop (Val x)  = ret x
+    loop (Val x)  = _ x
     loop (E u' q) = case decomp u' of
         Right x -> h x k
         Left  u -> E u (tsingleton k)
